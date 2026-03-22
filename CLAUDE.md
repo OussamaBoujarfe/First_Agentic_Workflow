@@ -1,3 +1,31 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Running Tools
+
+Tools are standalone Python scripts. Run them directly:
+
+```bash
+python tools/<script_name>.py
+```
+
+Load environment variables before running if the tool uses APIs:
+
+```bash
+source .env && python tools/<script_name>.py
+# or if .env uses export syntax:
+set -a && source .env && set +a && python tools/<script_name>.py
+```
+
+Install dependencies when a new tool requires packages not yet installed:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
 # Agent Instructions
 
 You're working inside the **WAT framework** (Workflows, Agents, Tools). This architecture separates concerns so that probabilistic AI handles reasoning while deterministic code handles execution. That separation is what makes this system reliable.
