@@ -1,2 +1,6 @@
 python-dotenv
 requests
+anthropic
+fastapi
+uvicorn[standard]
+python-multipart
