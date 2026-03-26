@@ -4,3 +4,4 @@ anthropic
 fastapi
 uvicorn[standard]
 python-multipart
+pdfplumber

@@ -1,8 +1,8 @@
 const CARDS = [
-  { key: 'Pass',     label: 'Pass',     icon: '✅', cls: 'pass'     },
-  { key: 'Fail',     label: 'Fail',     icon: '❌', cls: 'fail'     },
-  { key: 'Escalate', label: 'Escalate', icon: '⚠️', cls: 'escalate' },
-  { key: 'ERROR',    label: 'Error',    icon: '🔴', cls: 'error'    },
+  { key: 'Pass',             label: 'Pass',              icon: '✅', cls: 'pass'      },
+  { key: 'Failed',           label: 'Failed',            icon: '❌', cls: 'fail'      },
+  { key: 'Needs More Info',  label: 'Needs More Info',   icon: '⚠️', cls: 'needs'     },
+  { key: 'Undecided',        label: 'Undecided',         icon: '⏳', cls: 'undecided' },
 ]
 
 export default function SummaryCards({ counts, total }) {

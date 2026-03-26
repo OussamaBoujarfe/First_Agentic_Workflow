@@ -40,11 +40,14 @@ RESULT_COLUMNS = [
     "Registered_Name",
     "Registered_Address",
     "Document",
-    "OCR_Name",
-    "OCR_Address",
+    "Doc_Type",
+    "OCR_Customer_Name",
+    "OCR_Customer_Address",
     "OCR_Issue_Date",
-    "Agent_Decision",
-    "Agent_Reasoning",
+    "Is_PO_Box",
+    "Address_Transliterated",
+    "Human_Decision",   # Pass / Failed / Needs More Information (set by human agent)
+    "Agent_Notes",      # optional free-text from human agent
 ]
 
 

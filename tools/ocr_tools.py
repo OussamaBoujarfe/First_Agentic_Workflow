@@ -1,20 +1,29 @@
 """
 WAT Layer 3 - Tools: OCR Document Field Extractor
 ==================================================
-Uses Anthropic Claude Vision to extract three specific fields from a
-proof-of-address document (image, PDF, or JSON):
+Uses a hybrid approach for PDFs (pdfplumber fast path → Claude Vision fallback)
+and Claude Vision for images. Extracts structured fields from PoA documents.
 
-    name        — the account holder / billed-to name on the document
-    address     — the residential/billing address on the document
-    issue_date  — the document date (invoice date, statement date, etc.)
-
-Nothing else is extracted. Always returns the same four-key dict.
+Supported document types:
+  standard         — utility bills, bank statements, etc.
+  lease_agreement  — rental contracts, tenancy agreements
 
 Supported input formats:
-    .jpg / .jpeg    → image/jpeg
-    .png            → image/png
-    .pdf            → application/pdf  (sent as document block)
+    .jpg / .jpeg    → image/jpeg  (Claude Vision)
+    .png            → image/png   (Claude Vision)
+    .pdf            → pdfplumber if machine-readable, else Claude Vision
     .json           → read as UTF-8 text, passed inline
+
+Output schema:
+
+  Standard document:
+    { doc_type, customer_name, customer_address, issue_date,
+      is_po_box, address_transliterated, address_original, ocr_error }
+
+  Lease agreement:
+    { doc_type, landlord_name, tenant_name, both_signed, lease_duration,
+      customer_address, issue_date, is_po_box, address_transliterated,
+      address_original, ocr_error }
 
 Usage (smoke test):
     python tools/ocr_tools.py path/to/document.jpg
@@ -26,36 +35,59 @@ import os
 import re
 import sys
 import time
+import io
 
 import anthropic
+
+# ---------------------------------------------------------------------------
+# Graceful pdfplumber import (hybrid PDF fast path)
+# ---------------------------------------------------------------------------
+try:
+    import pdfplumber
+    _PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    pdfplumber = None
+    _PDFPLUMBER_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 OCR_MODEL         = "claude-haiku-4-5-20251001"
-OCR_MAX_TOKENS    = 256
+OCR_MAX_TOKENS    = 512
 OCR_MAX_RETRIES   = 4
 OCR_RETRY_BACKOFF = 15   # base seconds; doubles each attempt
+PDF_TEXT_MIN_CHARS = 30  # min chars from pdfplumber to skip Vision path
 
-OCR_SYSTEM_PROMPT = """You are a document field extractor for KYC compliance.
+OCR_SYSTEM_PROMPT = """You are a KYC document field extractor for a fintech compliance team.
+A human agent has already verified the document is authentic and an accepted document type.
+Your job: extract structured fields and return a single JSON object on one line.
 
-Your ONLY job: look at the document provided and return exactly three fields as a single JSON object on one line.
+STEP 1 — Classify the document:
+- If it is a Lease Agreement (rental contract, tenancy agreement), set "doc_type": "lease_agreement"
+- Otherwise, set "doc_type": "standard"
 
-Fields to extract:
-- name        : the account holder, billed-to, or customer name shown on the document
-- address     : the residential or billing address shown on the document
-- issue_date  : the document date (invoice date, statement date, bill date, etc.)
+STEP 2 — Extract fields based on doc_type:
+
+For "standard" documents (utility bills, bank statements, etc.):
+{"doc_type": "standard", "customer_name": "<account holder / billed-to name>", "customer_address": "<residential/billing address of the customer>", "issue_date": "<invoice/statement/bill date>", "address_transliterated": false, "address_original": null}
+
+For "lease_agreement" documents:
+{"doc_type": "lease_agreement", "landlord_name": "<landlord / lessor name>", "tenant_name": "<tenant / lessee name>", "both_signed": <true if signatures from BOTH landlord AND tenant are present, false otherwise>, "lease_duration": "<stay period or lease term, e.g. '12 months (01 Jan 2026 - 31 Dec 2026)'>", "customer_address": "<the leased property address>", "issue_date": "<lease start date or signing date>", "address_transliterated": false, "address_original": null}
+
+STEP 3 — Transliteration:
+If customer_address is written in a non-Latin script (Japanese, Chinese, Korean, Cyrillic, Arabic, Hindi, Urdu, Persian, or any other non-Latin writing system):
+- Transliterate and translate the address to English/Latin script
+- Put the English version in customer_address
+- Set "address_transliterated": true
+- Set "address_original": "<original non-Latin address>"
 
 Rules:
-- If a field is not visible or cannot be read, return an empty string "" for that field.
-- Return ONLY the JSON object. No prose, no explanation, no markdown fences.
-- Example output: {"name": "Jane Smith", "address": "123 Baker St, London NW1 6XE", "issue_date": "15 Jan 2026"}
-- Do not include any other fields."""
+- Return empty string "" for any field that is not visible or cannot be read.
+- Return ONLY the JSON object. No prose, no markdown fences, no explanation."""
 
 # ---------------------------------------------------------------------------
 # Media type detection
 # ---------------------------------------------------------------------------
-
 EXTENSION_MAP = {
     ".jpg":  "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -77,15 +109,63 @@ def _detect_media_type(filename: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# PO Box detection
+# ---------------------------------------------------------------------------
+_PO_BOX_RE = re.compile(r'\bP\.?\s*O\.?\s*B(?:OX|ox)\b', re.IGNORECASE)
+
+
+def _is_po_box(address: str) -> bool:
+    return bool(_PO_BOX_RE.search(address or ""))
+
+
+# ---------------------------------------------------------------------------
+# PDF text extraction (pdfplumber fast path)
+# ---------------------------------------------------------------------------
+def _extract_text_from_pdf(file_bytes: bytes) -> str:
+    """
+    Attempt to extract plain text from a PDF using pdfplumber.
+
+    Returns the concatenated text from all pages, or "" if:
+      - pdfplumber is not installed
+      - the PDF is scanned / image-only (no embedded text layer)
+      - any exception occurs during extraction
+    """
+    if not _PDFPLUMBER_AVAILABLE:
+        return ""
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            parts = [page.extract_text() for page in pdf.pages if page.extract_text()]
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Error response helper
+# ---------------------------------------------------------------------------
+def _error_result(msg: str) -> dict:
+    return {
+        "doc_type":               "standard",
+        "customer_name":          "",
+        "customer_address":       "",
+        "issue_date":             "",
+        "is_po_box":              False,
+        "address_transliterated": False,
+        "address_original":       None,
+        "ocr_error":              msg,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Core extraction function
 # ---------------------------------------------------------------------------
-
 def extract_document_fields(file_bytes: bytes, filename: str, client: anthropic.Anthropic) -> dict:
     """
-    WAT Layer 3 Tool: Extract name, address, and issue_date from a document.
+    WAT Layer 3 Tool: Extract structured fields from a PoA document.
 
-    Uses Claude Vision for images/PDFs, and inline text for JSON files.
-    Retries on rate-limit errors. Always returns the same four-key dict.
+    Uses pdfplumber fast path for machine-readable PDFs, Claude Vision for
+    images and scanned PDFs. Handles document type detection, transliteration
+    of non-Latin addresses, and PO Box flagging.
 
     Args:
         file_bytes : Raw bytes of the uploaded document.
@@ -93,33 +173,42 @@ def extract_document_fields(file_bytes: bytes, filename: str, client: anthropic.
         client     : Authenticated anthropic.Anthropic instance.
 
     Returns:
-        {
-            "name":       str,
-            "address":    str,
-            "issue_date": str,
-            "ocr_error":  str|None
-        }
+        Standard document:
+        { doc_type, customer_name, customer_address, issue_date,
+          is_po_box, address_transliterated, address_original, ocr_error }
+
+        Lease agreement:
+        { doc_type, landlord_name, tenant_name, both_signed, lease_duration,
+          customer_address, issue_date, is_po_box, address_transliterated,
+          address_original, ocr_error }
     """
     media_type = _detect_media_type(filename)
     raw = ""
 
-    # Build the content block once — reused across retry attempts
+    # Build the content block — reused across retry attempts
     if media_type == "text/plain":
-        # JSON/text file — pass content inline as text
         text_content = file_bytes.decode("utf-8")
         content = [{"type": "text", "text": f"Document content:\n\n{text_content}"}]
+
     elif media_type == "application/pdf":
-        # PDF — use document block
-        b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-        content = [
-            {
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-            },
-            {"type": "text", "text": "Extract the required fields from this document."},
-        ]
+        # Hybrid PDF path: try pdfplumber first (free), fall back to Vision
+        extracted_text = _extract_text_from_pdf(file_bytes)
+        if len(extracted_text) >= PDF_TEXT_MIN_CHARS:
+            content = [
+                {"type": "text", "text": "Document content (extracted from PDF):\n\n" + extracted_text}
+            ]
+        else:
+            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+            content = [
+                {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+                },
+                {"type": "text", "text": "Extract the required fields from this document."},
+            ]
+
     else:
-        # Image (JPEG / PNG)
+        # Image (JPEG / PNG) — always use Claude Vision
         b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
         content = [
             {
@@ -151,18 +240,38 @@ def extract_document_fields(file_bytes: bytes, filename: str, client: anthropic.
 
             parsed = json.loads(raw)
 
-            return {
-                "name":       str(parsed.get("name", "")),
-                "address":    str(parsed.get("address", "")),
-                "issue_date": str(parsed.get("issue_date", "")),
-                "ocr_error":  None,
-            }
+            doc_type = str(parsed.get("doc_type", "standard"))
+            customer_addr = str(parsed.get("customer_address", ""))
+            is_po_box = _is_po_box(customer_addr)
+
+            if doc_type == "lease_agreement":
+                return {
+                    "doc_type":               "lease_agreement",
+                    "landlord_name":          str(parsed.get("landlord_name", "")),
+                    "tenant_name":            str(parsed.get("tenant_name", "")),
+                    "both_signed":            bool(parsed.get("both_signed", False)),
+                    "lease_duration":         str(parsed.get("lease_duration", "")),
+                    "customer_address":       customer_addr,
+                    "issue_date":             str(parsed.get("issue_date", "")),
+                    "is_po_box":              is_po_box,
+                    "address_transliterated": bool(parsed.get("address_transliterated", False)),
+                    "address_original":       parsed.get("address_original") or None,
+                    "ocr_error":              None,
+                }
+            else:
+                return {
+                    "doc_type":               "standard",
+                    "customer_name":          str(parsed.get("customer_name", "")),
+                    "customer_address":       customer_addr,
+                    "issue_date":             str(parsed.get("issue_date", "")),
+                    "is_po_box":              is_po_box,
+                    "address_transliterated": bool(parsed.get("address_transliterated", False)),
+                    "address_original":       parsed.get("address_original") or None,
+                    "ocr_error":              None,
+                }
 
         except json.JSONDecodeError as e:
-            return {
-                "name": "", "address": "", "issue_date": "",
-                "ocr_error": f"JSON parse error: {e}. Raw: {raw[:120]}"
-            }
+            return _error_result(f"JSON parse error: {e}. Raw: {raw[:120]}")
 
         except anthropic.RateLimitError as e:
             last_error = str(e)
@@ -174,27 +283,17 @@ def extract_document_fields(file_bytes: bytes, filename: str, client: anthropic.
                 )
                 time.sleep(wait)
                 continue
-            return {
-                "name": "", "address": "", "issue_date": "",
-                "ocr_error": f"Rate limit after {OCR_MAX_RETRIES} attempts: {last_error}"
-            }
+            return _error_result(f"Rate limit after {OCR_MAX_RETRIES} attempts: {last_error}")
 
         except Exception as e:
-            return {
-                "name": "", "address": "", "issue_date": "",
-                "ocr_error": str(e)
-            }
+            return _error_result(str(e))
 
-    return {
-        "name": "", "address": "", "issue_date": "",
-        "ocr_error": f"OCR failed after {OCR_MAX_RETRIES} attempts. Last error: {last_error}"
-    }
+    return _error_result(f"OCR failed after {OCR_MAX_RETRIES} attempts. Last error: {last_error}")
 
 
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
@@ -225,4 +324,4 @@ if __name__ == "__main__":
 
     print("\n=== OCR Result ===")
     for k, v in result.items():
-        print(f"  {k:<12}: {v}")
+        print(f"  {k:<24}: {v}")
